@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 
 from . import db as dbmod
 from .errors import ApiError
-from .schemas import RegisterTubeRequest, SplitRequest
+from .schemas import ConsumptionRequest, RegisterTubeRequest, SplitRequest
 
 
 def _utcnow() -> str:
@@ -29,6 +29,19 @@ def _tube_view(row: sqlite3.Row) -> dict:
         "id": row["id"],
         "balance_ul": row["balance_ul"],
         "revision": row["revision"],
+        "initial_ul": row["initial_ul"],
+        "created_at": row["created_at"],
+    }
+
+
+def _consumption_record(row: sqlite3.Row) -> dict:
+    return {
+        "consumption_id": row["id"],
+        "tube_id": row["tube_id"],
+        "request_key": row["request_key"],
+        "expected_revision": row["expected_revision"],
+        "amount_ul": row["amount_ul"],
+        "purpose": row["purpose"],
         "created_at": row["created_at"],
     }
 
@@ -94,8 +107,9 @@ def create_app(db_path: str) -> FastAPI:
         now = _utcnow()
         try:
             conn.execute(
-                "INSERT INTO tubes (id, balance_ul, revision, created_at) VALUES (?, ?, 0, ?)",
-                (req.id, req.balance_ul, now),
+                "INSERT INTO tubes (id, balance_ul, revision, initial_ul, created_at) "
+                "VALUES (?, ?, 0, ?, ?)",
+                (req.id, req.balance_ul, req.balance_ul, now),
             )
         except sqlite3.IntegrityError:
             raise ApiError(409, "TUBE_ALREADY_EXISTS", f"tube {req.id!r} already exists")
@@ -104,7 +118,13 @@ def create_app(db_path: str) -> FastAPI:
         # a split from another request could commit between the INSERT and a
         # re-SELECT, and the response would then describe a state this
         # creation never produced.
-        return {"id": req.id, "balance_ul": req.balance_ul, "revision": 0, "created_at": now}
+        return {
+            "id": req.id,
+            "balance_ul": req.balance_ul,
+            "revision": 0,
+            "initial_ul": req.balance_ul,
+            "created_at": now,
+        }
 
     @app.get("/tubes")
     def list_tubes(conn: sqlite3.Connection = Depends(get_db)) -> dict:
@@ -258,8 +278,9 @@ def create_app(db_path: str) -> FastAPI:
             split_id = cur.lastrowid
             for position, child in enumerate(req.children):
                 conn.execute(
-                    "INSERT INTO tubes (id, balance_ul, revision, created_at) VALUES (?, ?, 0, ?)",
-                    (child.id, child.amount_ul, now),
+                    "INSERT INTO tubes (id, balance_ul, revision, initial_ul, created_at) "
+                    "VALUES (?, ?, 0, ?, ?)",
+                    (child.id, child.amount_ul, child.amount_ul, now),
                 )
                 conn.execute(
                     "INSERT INTO split_children (split_id, child_id, amount_ul, position) "
@@ -300,6 +321,168 @@ def create_app(db_path: str) -> FastAPI:
             except sqlite3.Error:
                 pass
             raise
+
+    # ---------------------------------------------------------------- consume
+
+    @app.post("/consumptions", status_code=201)
+    def consume_tube(req: ConsumptionRequest, conn: sqlite3.Connection = Depends(get_db)):
+        body = req.model_dump(mode="json")
+        canonical = _canonical(body)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        try:
+            # Same serialisation discipline as splits: BEGIN IMMEDIATE takes
+            # the write lock before any read, so a consumption and a split
+            # racing the same revision cannot both win — the loser sees the
+            # bumped revision and gets 412.
+            conn.execute("BEGIN IMMEDIATE")
+
+            replay = conn.execute(
+                "SELECT request_hash, response_body FROM consumption_idempotency_keys "
+                "WHERE request_key = ?",
+                (req.request_key,),
+            ).fetchone()
+            if replay is not None:
+                if replay["request_hash"] != digest:
+                    raise ApiError(
+                        409,
+                        "REQUEST_KEY_CONFLICT",
+                        f"request_key {req.request_key!r} was already used with a different body",
+                    )
+                conn.execute("COMMIT")
+                return JSONResponse(status_code=201, content=json.loads(replay["response_body"]))
+
+            tube = conn.execute(
+                "SELECT * FROM tubes WHERE id = ?", (req.tube_id,)
+            ).fetchone()
+            if tube is None:
+                raise ApiError(404, "TUBE_NOT_FOUND", f"tube {req.tube_id!r} does not exist")
+            if tube["revision"] != req.expected_revision:
+                raise ApiError(
+                    412,
+                    "REVISION_CONFLICT",
+                    f"tube {req.tube_id!r} is at revision {tube['revision']}, "
+                    f"not {req.expected_revision}",
+                )
+            if req.amount_ul > tube["balance_ul"]:
+                raise ApiError(
+                    422,
+                    "INSUFFICIENT_BALANCE",
+                    f"amount {req.amount_ul} uL exceeds tube balance "
+                    f"{tube['balance_ul']} uL",
+                )
+
+            now = _utcnow()
+            new_balance = tube["balance_ul"] - req.amount_ul
+            cur = conn.execute(
+                "UPDATE tubes SET balance_ul = ?, revision = revision + 1 "
+                "WHERE id = ? AND revision = ?",
+                (new_balance, req.tube_id, req.expected_revision),
+            )
+            if cur.rowcount != 1:  # unreachable under the write lock; defence in depth
+                raise ApiError(412, "REVISION_CONFLICT", f"tube {req.tube_id!r} changed concurrently")
+
+            cur = conn.execute(
+                "INSERT INTO consumptions (tube_id, request_key, expected_revision, "
+                "amount_ul, purpose, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (req.tube_id, req.request_key, req.expected_revision,
+                 req.amount_ul, req.purpose, now),
+            )
+            consumption_id = cur.lastrowid
+
+            response = {
+                "consumption_id": consumption_id,
+                "request_key": req.request_key,
+                "tube": {
+                    "id": tube["id"],
+                    "balance_ul": new_balance,
+                    "revision": req.expected_revision + 1,
+                },
+                "amount_ul": req.amount_ul,
+                "purpose": req.purpose,
+                "created_at": now,
+            }
+            conn.execute(
+                "INSERT INTO consumption_idempotency_keys (request_key, request_hash, "
+                "request_body, response_body, consumption_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (req.request_key, digest, canonical, json.dumps(response, ensure_ascii=False),
+                 consumption_id, now),
+            )
+            conn.execute("COMMIT")
+            return response
+        except Exception:
+            # Any failure — insufficient balance, out-of-range revision, or a
+            # write error — rolls the whole transaction back: no half-written
+            # voucher, no deducted balance, and the request key stays free.
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    @app.get("/tubes/{tube_id}/consumptions")
+    def get_tube_consumptions(tube_id: str, conn: sqlite3.Connection = Depends(get_db)) -> dict:
+        row = conn.execute("SELECT id FROM tubes WHERE id = ?", (tube_id,)).fetchone()
+        if row is None:
+            raise ApiError(404, "TUBE_NOT_FOUND", f"tube {tube_id!r} does not exist")
+        rows = conn.execute(
+            "SELECT * FROM consumptions WHERE tube_id = ? ORDER BY id", (tube_id,)
+        ).fetchall()
+        return {"tube_id": tube_id, "consumptions": [_consumption_record(r) for r in rows]}
+
+    @app.get("/tubes/{tube_id}/conservation")
+    def get_conservation(tube_id: str, conn: sqlite3.Connection = Depends(get_db)) -> dict:
+        # Conservation audit over the whole subtree rooted at tube_id: every
+        # descendant's current balance, every consumption voucher, and the
+        # frozen initial volume — all read inside one explicit transaction so
+        # the figures come from a single snapshot. Invariant: sum of balances
+        # + total consumed == initial volume. Splits only move microlitres
+        # within the subtree; consumption is the only way volume leaves it.
+        conn.execute("BEGIN")
+        try:
+            root = conn.execute("SELECT * FROM tubes WHERE id = ?", (tube_id,)).fetchone()
+            if root is None:
+                raise ApiError(404, "TUBE_NOT_FOUND", f"tube {tube_id!r} does not exist")
+            rows = conn.execute(
+                """
+                WITH RECURSIVE subtree(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT e.child_id FROM lineage_edges e
+                    JOIN subtree s ON e.parent_id = s.id
+                )
+                SELECT t.* FROM tubes t JOIN subtree s ON t.id = s.id
+                ORDER BY t.rowid
+                """,
+                (tube_id,),
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            placeholders = ", ".join("?" for _ in ids)
+            vouchers = conn.execute(
+                f"SELECT * FROM consumptions WHERE tube_id IN ({placeholders}) ORDER BY id",
+                ids,
+            ).fetchall()
+            total_balance = sum(r["balance_ul"] for r in rows)
+            total_consumed = sum(v["amount_ul"] for v in vouchers)
+            initial = root["initial_ul"]
+            result = {
+                "tube_id": tube_id,
+                "initial_ul": initial,
+                "total_balance_ul": total_balance,
+                "total_consumed_ul": total_consumed,
+                "conserved": initial is not None
+                and total_balance + total_consumed == initial,
+                "tubes": [_tube_view(r) for r in rows],
+                "consumptions": [_consumption_record(v) for v in vouchers],
+            }
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        conn.execute("COMMIT")
+        return result
 
     return app
 

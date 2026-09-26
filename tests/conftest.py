@@ -21,6 +21,16 @@ def make_split(parent: str, revision: int, key: str, children: list[tuple[str, i
     }
 
 
+def make_consumption(tube: str, revision: int, key: str, amount: int, purpose: str = "assay") -> dict:
+    return {
+        "tube_id": tube,
+        "expected_revision": revision,
+        "request_key": key,
+        "amount_ul": amount,
+        "purpose": purpose,
+    }
+
+
 def total_balance(client: TestClient) -> int:
     return sum(t["balance_ul"] for t in client.get("/tubes").json()["tubes"])
 

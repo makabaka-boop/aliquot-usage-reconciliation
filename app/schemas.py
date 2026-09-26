@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints, model_validator
 
 TubeId = Annotated[str, Field(min_length=1, max_length=128)]
 # Volumes are persisted in SQLite INTEGER columns (signed 64-bit). Anything
@@ -41,3 +41,14 @@ class SplitRequest(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("children ids must be unique within one split request")
         return self
+
+
+class ConsumptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tube_id: TubeId
+    expected_revision: Annotated[StrictInt, Field(ge=0)]
+    request_key: Annotated[str, Field(min_length=1, max_length=128)]
+    amount_ul: PositiveUl
+    # Non-empty purpose: whitespace-only strings are stripped to empty and rejected.
+    purpose: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)]
