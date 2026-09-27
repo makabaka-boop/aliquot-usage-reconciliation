@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 TubeId = Annotated[str, Field(min_length=1, max_length=128)]
 # Volumes are persisted in SQLite INTEGER columns (signed 64-bit). Anything
@@ -41,3 +41,22 @@ class SplitRequest(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("children ids must be unique within one split request")
         return self
+
+
+class ConsumeRequest(BaseModel):
+    """Irreversible consumption voucher: takes volume out of a tube for good."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tube_id: TubeId
+    expected_revision: Annotated[StrictInt, Field(ge=0)]
+    request_key: Annotated[str, Field(min_length=1, max_length=128)]
+    amount_ul: PositiveUl
+    purpose: Annotated[str, Field(min_length=1, max_length=512)]
+
+    @field_validator("purpose")
+    @classmethod
+    def _purpose_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("purpose must be non-empty")
+        return v
